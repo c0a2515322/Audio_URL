@@ -5,32 +5,57 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>音響通信システム (Final Version)</title>
-    <script src="dsp.js"></script>
     <style>
         body {
             font-family: sans-serif;
             padding: 1em;
             margin: 0;
+            background-color: #f9f9f9;
         }
 
         .container {
             max-width: 600px;
             margin: auto;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            padding: 20px;
         }
 
         .section {
-            border: 1px solid #ccc;
+            border: 1px solid #ddd;
             border-radius: 8px;
             padding: 16px;
             margin-bottom: 16px;
+            background-color: #fafafa;
         }
 
         .warning-box {
             background: #d4edda;
             border: 1px solid #c3e6cb;
-            padding: 10px;
+            padding: 12px;
             border-radius: 5px;
             margin-bottom: 15px;
+            font-size: 0.95em;
+        }
+
+        button {
+            padding: 8px 16px;
+            margin: 5px;
+            font-size: 1em;
+        }
+
+        input[type="text"] {
+            padding: 8px;
+            font-size: 1em;
+            width: calc(100% - 100px);
+            /* ボタン分の幅を引く */
+            margin-right: 10px;
+            box-sizing: border-box;
+        }
+
+        #textResult {
+            word-break: break-all;
         }
     </style>
 </head>
@@ -41,12 +66,12 @@
         <div class="warning-box">
             <strong>最終的な使い方:</strong><br>
             このシステムは、2つのデバイス（PCとスマホなど）で動作するように設計されています。<br>
-            1. <strong>受信側デバイス</strong>で「受信開始」を押します。<br>
+            1. <strong>受信側デバイス</strong>で「受信開始」を押します（最初にマイクの許可が必要です）。<br>
             2. <strong>送信側デバイス</strong>で「送信」を押し、受信側のマイクにスピーカーを近づけてください。
         </div>
         <div class="section">
             <h2>📤 送信側 (Sender)</h2>
-            <input type="text" id="urlInput" value="This Works!" style="width: 300px;">
+            <input type="text" id="urlInput" value="This Works!" placeholder="送信するテキストを入力">
             <button id="sendButton">送信</button>
             <p>ステータス: <span id="status-tx">待機中</span></p>
         </div>
@@ -64,12 +89,12 @@
 
     <script>
         // === Final Version 設定: 可聴域チャープ ===
-        let SAMPLE_RATE = 48000;
+        let SAMPLE_RATE = 48000; // 受信側で動的に上書きされる
         const SYNC_FREQ_START = 2000, SYNC_FREQ_END = 6000, SYNC_DURATION_MS = 200;
         const DATA_FREQ_LOW = 4000, DATA_FREQ_HIGH = 5000;
         const BIT_DURATION_MS = 40, CHAR_PAUSE_MS = 40;
         const SCRIPT_PROCESSOR_SIZE = 4096;
-        const CORRELATION_THRESHOLD = 0.4;
+        const CORRELATION_THRESHOLD = 0.7; // 検出感度を少し上げた
         const GAIN_VALUE = 5.0;
 
         // UI要素
@@ -80,130 +105,278 @@
             debugData0 = document.getElementById('debug-data0'), debugData1 = document.getElementById('debug-data1'),
             resetButton = document.getElementById('resetButton');
 
-        let txAudioContext;
-        function playChirp(startFreq, endFreq, durationMs) {
-            if (!txAudioContext || txAudioContext.state === 'closed') txAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-            const gainNode = txAudioContext.createGain(); gainNode.gain.value = GAIN_VALUE;
+        // 送信側 AudioContext (必要になったときに初期化)
+        let txAudioContext = null;
+
+        // 送信処理 (AudioContextの初期化と再生)
+        async function playChirp(startFreq, endFreq, durationMs) {
+            // AudioContextが存在しない、または中断されている場合は再開または作成
+            if (!txAudioContext || txAudioContext.state === 'closed') {
+                txAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+            }
+            if (txAudioContext.state === 'suspended') {
+                await txAudioContext.resume(); // ユーザー操作後に再生可能にする
+            }
+
+            const gainNode = txAudioContext.createGain();
+            gainNode.gain.value = GAIN_VALUE;
             gainNode.connect(txAudioContext.destination);
+
             const oscillator = txAudioContext.createOscillator();
             oscillator.type = 'sine';
             oscillator.frequency.setValueAtTime(startFreq, txAudioContext.currentTime);
             oscillator.frequency.linearRampToValueAtTime(endFreq, txAudioContext.currentTime + durationMs / 1000);
-            oscillator.connect(gainNode); oscillator.start();
+
+            oscillator.connect(gainNode);
+            oscillator.start();
             oscillator.stop(txAudioContext.currentTime + durationMs / 1000);
+
             return new Promise(resolve => setTimeout(resolve, durationMs));
         }
+
         sendButton.onclick = async () => {
-            statusTx.textContent = '送信中...'; sendButton.disabled = true;
-            console.log('送信: 同期信号 (2-6kHz)');
-            await playChirp(SYNC_FREQ_START, SYNC_FREQ_END, SYNC_DURATION_MS);
-            const textToSend = urlInput.value;
-            const binaryChars = textToSend.split('').map(char => ('0'.repeat(8) + char.charCodeAt(0).toString(2)).slice(-8));
-            for (const charBits of binaryChars) {
-                for (const bit of charBits) {
-                    if (bit === '0') await playChirp(DATA_FREQ_HIGH, DATA_FREQ_LOW, BIT_DURATION_MS);
-                    else await playChirp(DATA_FREQ_LOW, DATA_FREQ_HIGH, BIT_DURATION_MS);
+            if (sendButton.disabled) return; // 連打防止
+
+            statusTx.textContent = '送信中...';
+            sendButton.disabled = true;
+
+            try {
+                console.log('送信: 同期信号 (2-6kHz)');
+                await playChirp(SYNC_FREQ_START, SYNC_FREQ_END, SYNC_DURATION_MS);
+
+                const textToSend = urlInput.value;
+                const binaryChars = textToSend.split('').map(char => ('0'.repeat(8) + char.charCodeAt(0).toString(2)).slice(-8));
+
+                for (const charBits of binaryChars) {
+                    for (const bit of charBits) {
+                        if (bit === '0') {
+                            await playChirp(DATA_FREQ_HIGH, DATA_FREQ_LOW, BIT_DURATION_MS);
+                        } else {
+                            await playChirp(DATA_FREQ_LOW, DATA_FREQ_HIGH, BIT_DURATION_MS);
+                        }
+                    }
+                    await new Promise(resolve => setTimeout(resolve, CHAR_PAUSE_MS));
                 }
-                await new Promise(resolve => setTimeout(resolve, CHAR_PAUSE_MS));
+                statusTx.textContent = '送信完了';
+            } catch (e) {
+                console.error("送信中にエラー:", e);
+                statusTx.textContent = '送信エラー';
+            } finally {
+                sendButton.disabled = false;
             }
-            statusTx.textContent = '送信完了'; sendButton.disabled = false;
         };
 
         // === 受信側ロジック ===
-        let rxAudioContext, microphoneStream, isListening = false, receiveState = 'IDLE',
+        let rxAudioContext = null, microphoneStream = null, isListening = false, receiveState = 'IDLE',
             syncTemplate, data0Template, data1Template, scriptProcessor, continuousInputBuffer;
 
+        // チャープテンプレート生成関数
         function generateChirpTemplate(sampleRate, startFreq, endFreq, durationMs) {
-            const durationSec = durationMs / 1000, bufferSize = Math.ceil(sampleRate * durationSec);
+            const durationSec = durationMs / 1000;
+            const bufferSize = Math.ceil(sampleRate * durationSec);
             const buffer = new Float32Array(bufferSize);
             for (let i = 0; i < bufferSize; i++) {
                 const t = i / sampleRate;
+                // チャープ信号の位相を計算 (線形チャープ)
                 const phase = 2 * Math.PI * (startFreq * t + (endFreq - startFreq) * t * t / (2 * durationSec));
                 buffer[i] = Math.sin(phase);
             }
             return buffer;
         }
+
+        // 正規化相互相関関数
         function normalizedCrossCorrelation(signal, template) {
-            let maxCorr = 0; const n = signal.length, m = template.length; if (n < m) return 0;
+            let maxCorr = 0;
+            const n = signal.length, m = template.length;
+            if (n < m) return 0;
+
+            // テンプレートの平均と標準偏差を計算
             const templateMean = template.reduce((a, b) => a + b) / m;
-            const templateStdDev = Math.sqrt(template.reduce((sum, val) => sum + Math.pow(val - templateMean, 2), 0));
+            const templateVariance = template.reduce((sum, val) => sum + Math.pow(val - templateMean, 2), 0);
+            const templateStdDev = Math.sqrt(templateVariance);
             if (templateStdDev === 0) return 0;
+
+            // 信号のスライディングウィンドウで相関を計算
             for (let i = 0; i <= n - m; i++) {
                 const subSignal = signal.slice(i, i + m);
                 const subSignalMean = subSignal.reduce((a, b) => a + b) / m;
-                const subSignalStdDev = Math.sqrt(subSignal.reduce((sum, val) => sum + Math.pow(val - subSignalMean, 2), 0));
-                if (subSignalStdDev === 0) continue; let corr = 0;
-                for (let j = 0; j < m; j++) corr += (subSignal[j] - subSignalMean) * (template[j] - templateMean);
-                maxCorr = Math.max(maxCorr, corr / (templateStdDev * subSignalStdDev));
+                const subSignalVariance = subSignal.reduce((sum, val) => sum + Math.pow(val - subSignalMean, 2), 0);
+                const subSignalStdDev = Math.sqrt(subSignalVariance);
+
+                if (subSignalStdDev === 0) continue; // ゼロ除算防止
+
+                let sumProduct = 0;
+                for (let j = 0; j < m; j++) {
+                    sumProduct += (subSignal[j] - subSignalMean) * (template[j] - templateMean);
+                }
+                const corr = sumProduct / (templateStdDev * subSignalStdDev);
+                maxCorr = Math.max(maxCorr, corr);
             }
             return maxCorr;
         }
 
+        // 受信データ保持用変数
         let receivedBinary = '', nextBitTime = 0, receivedText = '', lastSyncTime = 0;
 
+        // 音声処理 (ScriptProcessorNodeで呼ばれる)
         function processAudio(event) {
             if (!isListening) return;
+
             const inputData = event.inputBuffer.getChannelData(0);
             const now = rxAudioContext.currentTime;
-            const tempBuffer = new Float32Array(continuousInputBuffer.length);
-            tempBuffer.set(continuousInputBuffer.slice(inputData.length));
-            tempBuffer.set(inputData, continuousInputBuffer.length - inputData.length);
-            continuousInputBuffer = tempBuffer;
+
+            // 入力バッファを更新 (古いデータを捨てて新しいデータを追加)
+            const newBuffer = new Float32Array(continuousInputBuffer.length);
+            newBuffer.set(continuousInputBuffer.slice(inputData.length));
+            newBuffer.set(inputData, continuousInputBuffer.length - inputData.length);
+            continuousInputBuffer = newBuffer;
+
             if (receiveState === 'IDLE') {
+                // 同期信号の検出
                 const correlation = normalizedCrossCorrelation(continuousInputBuffer, syncTemplate);
                 debugSync.textContent = correlation.toFixed(4);
+
                 if (correlation > CORRELATION_THRESHOLD && (now - lastSyncTime) > 1.0) {
                     lastSyncTime = now;
                     console.log(`%c同期信号検出！相関ピーク: ${correlation.toFixed(4)}`, 'color: green; font-weight: bold;');
-                    statusRx.textContent = 'データ受信中...'; receiveState = 'RECEIVING';
-                    receivedBinary = ''; binaryResult.textContent = ''; receivedText = ''; textResult.textContent = '';
-                    nextBitTime = now + (SYNC_DURATION_MS / 1000);
+                    statusRx.textContent = 'データ受信中...';
+                    receiveState = 'RECEIVING';
+                    receivedBinary = '';
+                    binaryResult.textContent = '';
+                    receivedText = '';
+                    textResult.textContent = '';
+                    // 次のビットを受信する予定時刻を計算
+                    nextBitTime = now + (SYNC_DURATION_MS / 1000) + (BIT_DURATION_MS / 1000) / 2; // 半ビット分のオフセットを追加
                 }
             } else if (receiveState === 'RECEIVING') {
+                // 次のビットの受信予定時刻になったら処理
                 if (now >= nextBitTime) {
-                    const analysisBuffer = continuousInputBuffer.slice(-data0Template.length);
-                    const corr0 = normalizedCrossCorrelation(analysisBuffer, data0Template);
-                    const corr1 = normalizedCrossCorrelation(analysisBuffer, data1Template);
-                    debugData0.textContent = corr0.toFixed(4); debugData1.textContent = corr1.toFixed(4);
-                    const bit = corr0 > corr1 ? '0' : '1';
-                    console.log(`ビット検出: ${bit} (Corr0: ${corr0.toFixed(3)}, Corr1: ${corr1.toFixed(3)})`);
-                    receivedBinary += bit; binaryResult.textContent = receivedBinary;
+                    const analysisStartIndex = Math.max(0, continuousInputBuffer.length - data0Template.length * 2); // 少し余裕を持たせる
+                    const analysisBuffer = continuousInputBuffer.slice(analysisStartIndex, analysisStartIndex + data0Template.length * 2);
+
+                    // 最も相関が高い位置を探す (簡易的なタイミング同期)
+                    let bestCorr0 = 0, bestCorr1 = 0;
+                    for (let offset = 0; offset <= analysisBuffer.length - data0Template.length; offset++) {
+                        const subBuffer = analysisBuffer.slice(offset, offset + data0Template.length);
+                        const corr0 = normalizedCrossCorrelation(subBuffer, data0Template);
+                        const corr1 = normalizedCrossCorrelation(subBuffer, data1Template);
+                        if (corr0 > bestCorr0) bestCorr0 = corr0;
+                        if (corr1 > bestCorr1) bestCorr1 = corr1;
+                    }
+
+                    debugData0.textContent = bestCorr0.toFixed(4);
+                    debugData1.textContent = bestCorr1.toFixed(4);
+
+                    const bit = bestCorr0 > bestCorr1 ? '0' : '1';
+                    console.log(`ビット検出: ${bit} (Corr0: ${bestCorr0.toFixed(3)}, Corr1: ${bestCorr1.toFixed(3)})`);
+                    receivedBinary += bit;
+                    binaryResult.textContent = receivedBinary;
+
                     if (receivedBinary.length % 8 === 0) {
                         const char = String.fromCharCode(parseInt(receivedBinary.slice(-8), 2));
-                        receivedText += char; textResult.textContent = receivedText;
+                        receivedText += char;
+                        textResult.textContent = receivedText;
                         console.log(`%c文字受信: "${char}"`, 'color: blue; font-weight: bold;');
+                        // 次の文字の最初のビットの時間
                         nextBitTime += (BIT_DURATION_MS + CHAR_PAUSE_MS) / 1000;
-                    } else { nextBitTime += BIT_DURATION_MS / 1000; }
-                    if (now - lastSyncTime > 5) { console.log("受信タイムアウト"); resetButton.onclick(); }
+                    } else {
+                        // 次のビットの時間
+                        nextBitTime += BIT_DURATION_MS / 1000;
+                    }
+
+                    // タイムアウト処理 (同期後5秒でリセット)
+                    if (now - lastSyncTime > 5) {
+                        console.log("受信タイムアウト");
+                        resetButton.onclick();
+                    }
                 }
             }
         }
 
+        // 受信開始処理
         async function startListening() {
             if (isListening) return;
             statusRx.textContent = 'マイク準備中...';
+
             try {
-                const constraints = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 }, video: false };
+                // マイクの制約 (エコーキャンセラなどを無効化)
+                const constraints = {
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                        // sampleRate: 48000 // 指定しないことでデバイスのネイティブレートを使用
+                    },
+                    video: false
+                };
                 microphoneStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+                // 受信側AudioContextの作成 (マイク取得後に作成)
                 rxAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-                SAMPLE_RATE = rxAudioContext.sampleRate;
+                SAMPLE_RATE = rxAudioContext.sampleRate; // 実際のサンプルレートを取得
                 console.log(`%c実際のサンプルレート: ${SAMPLE_RATE} Hz`, 'color: blue; font-size: 1.1em;');
+
+                // 各チャープのテンプレートを生成 (サンプルレートに合わせて)
                 syncTemplate = generateChirpTemplate(SAMPLE_RATE, SYNC_FREQ_START, SYNC_FREQ_END, SYNC_DURATION_MS);
                 data0Template = generateChirpTemplate(SAMPLE_RATE, DATA_FREQ_HIGH, DATA_FREQ_LOW, BIT_DURATION_MS);
                 data1Template = generateChirpTemplate(SAMPLE_RATE, DATA_FREQ_LOW, DATA_FREQ_HIGH, BIT_DURATION_MS);
+
+                // 入力バッファの初期化
                 continuousInputBuffer = new Float32Array(SCRIPT_PROCESSOR_SIZE * 2);
+
+                // マイク -> Gain -> ScriptProcessor -> 処理
                 const source = rxAudioContext.createMediaStreamSource(microphoneStream);
-                const gainNode = rxAudioContext.createGain(); gainNode.gain.value = GAIN_VALUE;
+                const gainNode = rxAudioContext.createGain();
+                gainNode.gain.value = GAIN_VALUE;
                 scriptProcessor = rxAudioContext.createScriptProcessor(SCRIPT_PROCESSOR_SIZE, 1, 1);
                 scriptProcessor.onaudioprocess = processAudio;
-                source.connect(gainNode); gainNode.connect(scriptProcessor);
-                isListening = true; listenButton.textContent = '受信停止';
-                statusRx.textContent = '同期信号待機中...'; console.log('受信開始、同期信号を待っています...');
-            } catch (err) { console.error("マイクの起動に失敗:", err); statusRx.textContent = "マイクエラー"; }
+
+                source.connect(gainNode);
+                gainNode.connect(scriptProcessor);
+
+                isListening = true;
+                listenButton.textContent = '受信停止';
+                statusRx.textContent = '同期信号待機中...';
+                console.log('受信開始、同期信号を待っています...');
+            } catch (err) {
+                console.error("マイクの起動に失敗:", err);
+                statusRx.textContent = `マイクエラー: ${err.message || '不明なエラー'}`;
+                // 一時的なエラーでもリセットボタンで再試行できるようにしておく
+            }
         }
-        function stopListening() { if (!isListening) return; isListening = false; if (microphoneStream) microphoneStream.getTracks().forEach(track => track.stop()); if (scriptProcessor) scriptProcessor.disconnect(); if (rxAudioContext) rxAudioContext.close().catch(e => console.error(e)); listenButton.textContent = '受信開始'; statusRx.textContent = '停止中'; console.log('受信停止'); }
-        resetButton.onclick = () => { receiveState = 'IDLE'; receivedBinary = ''; binaryResult.textContent = ''; receivedText = ''; statusRx.textContent = isListening ? '同期信号待機中...' : 'リセット完了'; };
+
+        // 受信停止処理
+        function stopListening() {
+            if (!isListening) return;
+            isListening = false;
+            if (microphoneStream) {
+                microphoneStream.getTracks().forEach(track => track.stop());
+            }
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+            }
+            if (rxAudioContext) {
+                rxAudioContext.close().catch(e => console.error("AudioContextクローズエラー:", e));
+            }
+            listenButton.textContent = '受信開始';
+            statusRx.textContent = '停止中';
+            console.log('受信停止');
+        }
+
+        // リセット処理
+        resetButton.onclick = () => {
+            receiveState = 'IDLE';
+            receivedBinary = '';
+            binaryResult.textContent = '';
+            receivedText = '';
+            textResult.textContent = '';
+            statusRx.textContent = isListening ? '同期信号待機中...' : 'リセット完了';
+            console.log('受信状態をリセットしました。');
+        };
+
+        // 受信開始/停止ボタンのトグル
         listenButton.onclick = () => isListening ? stopListening() : startListening();
+
     </script>
 </body>
 
